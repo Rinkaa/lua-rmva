@@ -98,20 +98,42 @@ class Lua
 
     # 打开基础库（math, string, table之类）
     LuaOpenLibs.call(@lua)
-#    # 重设输出到调试控制台
-#    rm_print_lua = <<-EOF
-#    _G.print = function(...)
-#      local n = select(\'\#\', ...)
-#      local c = require(\'winapi\').get_console()
-#      for i = 1, n do
-#        c:write(tostring(select(i, ...)))
-#        c:write((i~=n) and \'\\t\' or \'\\n\')
-#      end
-#    end
-#    return nil
-#EOF
-#    LuaLoadString.call(@lua, rm_print_lua)
-#    LuaPCall.call(@lua, 0, 0, 0)
+    # 重设输出到调试控制台
+    rm_print_lua = <<-EOF
+-- lua
+local ffi = require 'ffi'
+ffi.cdef[[
+typedef void *HANDLE;
+typedef unsigned long DWORD;
+typedef DWORD *LPDWORD;
+typedef int BOOL;
+typedef void VOID;
+typedef void *LPVOID;
+HANDLE GetStdHandle(
+  long in_nStdHandle
+);
+BOOL WriteConsoleA(
+  HANDLE in_hConsoleOutput, 
+  const VOID *in_lpBuffer, 
+  DWORD in_nNumberOfCharsToWrite,
+  LPDWORD out_opt_lpNumberOfCharsWritten,
+  LPVOID lpReserved
+);
+]]
+local out_charsWritten = ffi.new('long[1]')
+local console = ffi.C.GetStdHandle(-11) -- stdout=-11
+local function write(str) ffi.C.WriteConsoleA(console, str, #str, out_charsWritten, nil) end
+_G.print = function(...)
+  local n = select(\'\#\', ...)
+  for i = 1, n do
+    write(tostring(select(i, ...)))
+    write((i~=n) and \'\\t\' or \'\\n\')
+  end
+  return nil
+end
+EOF
+    LuaLoadString.call(@lua, rm_print_lua)
+    LuaPCall.call(@lua, 0, 0, 0)
   end
 
   # Ruby调用Lua过程，可以传参和取返回值，支持多参多返回值；给定retsBuffer时使用此buffer存放返回值，否则新建Array存放返回值
@@ -154,9 +176,7 @@ class Lua
     if retsBuffer != nil
       rets = retsBuffer
       rets.fill(nil)
-      if rets.length < n_ret
-        n_ret = rets.length
-      end
+      n_ret = rets.length if rets.length < n_ret
     else
       rets = Array.new(n_ret)
     end
