@@ -87,6 +87,8 @@ class Lua_C
     _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
     _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
     _VirtualAlloc = Win32API.new('kernel32', 'VirtualAlloc', 'llll', 'l')
+    _VirtualFree = Win32API.new('kernel32', 'VirtualFree', 'lll', 'l')
+    #~ VirtualProtect = Win32API.new('kernel32', 'VirtualProtect', 'llll', 'l')
     _RtlMoveMemory_lp = Win32API.new('kernel32', 'RtlMoveMemory', 'lpi', '')
     _CallWindowProc_ippii = Win32API.new('user32', 'CallWindowProc', 'ippii', 'i')
     @@lua_tonumber_addr = _GetProcAddress.(
@@ -111,6 +113,14 @@ class Lua_C
       0x5D,               # pop  ebp
       0xC3,               # ret
     ].pack('C*')
+
+    if class_variable_defined?(:@@custom_tonumber_caller_addr) &&
+      @@custom_tonumber_caller_addr && @@custom_tonumber_caller_addr != 0
+      _VirtualFree.call(
+        @@custom_tonumber_caller_addr,
+        0,
+        0x00008000) # MEM_RELEASE
+    end
     @@custom_tonumber_caller_addr = _VirtualAlloc.(
       0,
       @@custom_tonumber_caller.bytesize,
@@ -240,8 +250,8 @@ class Lua_CrossBoundaryReferenceManager
     Lua_C.settable(@s, -3)            # <3>`mapping`.[<4>key] = <5>obj
     Lua_C.settop(@s, -2)
     Lua_C.getfield(@s, -2, 'source') # <3>=`source`
-    Lua_C.pushvalue(@s, idx)          # <4>=<idx>obj
-    Lua_C.pushstring(@s, 'lua')            # <5>="lua"
+    Lua_C.pushvalue(@s, idx)         # <4>=<idx>obj
+    Lua_C.pushstring(@s, 'lua')      # <5>="lua"
     Lua_C.settable(@s, -3)           # <3>`source`.[<4>obj] = <5>"lua"
     Lua_C.settop(@s, -4)
     # 在Ruby侧创建包装对象
@@ -328,12 +338,6 @@ class Lua_CrossBoundaryReferenceManager
   end
   def push_callable(stack, callable)
   end
-  def get_table(stack, idx)
-  end
-  def get_function(stack, idx)
-  end
-  def get_userdata(stack, idx)
-  end
 end
 
 # 在Lua侧创建的对象来到Ruby时的包装类
@@ -351,10 +355,9 @@ class Lua_WrappedObject
   def type
     @type
   end
-  # 转换为字符串显示
-  # TODO：考虑lua侧的metatable中的__tostring？
-  def to_s
-    return "<Lua_WrappedObject: @key=#{@key}, @type=#{@type}>"
+  # 转换为Debug查看数据显示
+  def inspect
+    return "<Lua_WrappedObject:0x%x @key=%d, @type=%d>" % [object_id * 2, @key, @type]
   end
 
   # 视为table，访问其元素
@@ -378,6 +381,16 @@ class Lua_WrappedObject
     @lua.cross_boundary.pop
   end
   alias :set :[]=
+  # 转换为字符串
+  def to_s
+    # TODO: 异常处理
+    @lua.cross_boundary.push(@key)
+    @lua.tostring(-1)
+    result = @lua.pop
+    @lua.cross_boundary.pop
+    return result
+  end
+  alias :tostring :to_s
 
   # 视为callable table / callable userdata / function，调用之
   # Ruby调用Lua过程，可以传参和取返回值，支持多参多返回值
@@ -480,7 +493,7 @@ class Lua_VM
     end
   end
   # 函数调用
-  # 上方n_args个对象依次视作参数，n_args+1位置视为要调用的函数
+  # 上方n_args个对象依次视作参数，上方往下数n_args+1位置视为要调用的函数
   # 之后弹出参数和函数，并试图放入n_results个返回值
   def call(n_args, n_results)
     result = Lua_C.pcall(@s, n_args, n_results, 0)
@@ -556,6 +569,7 @@ class Lua_VM
   def reset
     Lua_C.settop(@s, 0)
   end
+
   # 将Lua栈第i位的内容视作table，栈顶视作key，访问table[key]
   # key将被弹出，并将结果value替换到栈顶
   # i为1表示栈底；-1时表示栈顶，-2时表示从顶向底第二位，以此类推
@@ -569,13 +583,23 @@ class Lua_VM
   def tset(i=-3)
     Lua_C.settable(@s, i)
   end
+  # 将Lua栈第i位内容的字符串表示推向栈顶
+  # 相当于在Lua侧对内容使用tostring得到字符串表示
+  def tostring(i=-1)
+    len = Lua_C.gettop(@s)
+    i = len + 1 + i if i < 0
+    Lua_C.getfield(@s, Lua_C::LUA_GLOBALSINDEX, 'tostring')
+    Lua_C.pushvalue(@s, i)
+    call(1, 1)
+  end
+
   # 由于Lua到Ruby类型转换错误而抛出异常
   def raise_unsupported_lua_type_error(value, extra_msg=nil)
     type_enum_name = Lua_C::BASIC_TYPES.find {
       |s| Lua_C.const_get(s) == value
     } || "Unknown Type #{value}"
     msg = "Error: Lua type not supported for Ruby, type enum is #{type_enum_name}."
-    msg += (extra_msg==nil ? '' : ('\n' + extra_msg))
+    msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
     raise msg
   end
   # 由于编译或运行错误而抛出异常
@@ -586,7 +610,7 @@ class Lua_VM
     } || "Unknown Error #{value}"
     msg = "Error: Lua code failed to compile or run, error enum is #{err_enum_name},\n"
     msg += "message is #{pop}."
-    msg += (extra_msg==nil ? '' : ('\n' + extra_msg))
+    msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
     raise msg
   end
   # 关闭Lua虚拟机，释放空间
