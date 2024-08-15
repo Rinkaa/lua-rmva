@@ -156,6 +156,37 @@ class Lua_C
     @@dll_path = ''
     @@loaded = false
   end
+
+  # 由于Lua到Ruby类型转换错误而抛出异常
+  def self.raise_unsupported_lua_type_error(lua_state, value, extra_msg=nil)
+    type_enum_name = BASIC_TYPES.find {
+      |s| const_get(s) == value
+    } || "Unknown Type #{value}"
+    msg = "Error: Lua type not supported for Ruby, type enum is #{type_enum_name}."
+    msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
+    raise msg
+  end
+  # 由于编译或运行错误而抛出异常
+  # 会把栈顶对象当作错误信息，并将其从栈中弹出
+  def self.raise_thread_status_error(lua_state, value, extra_msg=nil)
+    err_enum_name = THREAD_STATUSES.find {
+      |s| const_get(s) == value
+    } || "Unknown Error #{value}"
+    getfield(lua_state, LUA_GLOBALSINDEX, 'tostring')
+    pushvalue(lua_state, -2)
+    convert_tostring_result = pcall(lua_state, 1, 1, 0)
+    error_string = nil
+    if convert_tostring_result == Lua_C::LUA_OK
+      error_string = tolstring(lua_state, -1, 0).force_encoding(__ENCODING__)
+    else
+      error_string = "<Unable to convert lua error to string>"
+    end
+    settop(lua_state, -3)
+    msg = "Error: Lua code failed to compile or run, error enum is #{err_enum_name},\n"
+    msg += "message is #{error_string}."
+    msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
+    raise msg
+  end
 end
 
 # 为跨语言界面的对象提供引用管理
@@ -480,7 +511,7 @@ class Lua_VM
     result = Lua_C.loadstring(@s, str)
     if result != Lua_C::LUA_OK
       # 编译出错
-      raise_thread_status_error(result, "Code is: |\n#{str}") 
+      Lua_C.raise_thread_status_error(@s, result, "Code is: |\n#{str}") 
     end
     return nil
   end
@@ -489,7 +520,7 @@ class Lua_VM
     result = Lua_C.loadfile(@s, filename)
     if result != Lua_C::LUA_OK
       # 编译出错
-      raise_thread_status_error(result, "Code file is #{filename}.")
+      Lua_C.raise_thread_status_error(@s, result, "Code file is #{filename}.")
     end
   end
   # 函数调用
@@ -499,7 +530,7 @@ class Lua_VM
     result = Lua_C.pcall(@s, n_args, n_results, 0)
     if result != Lua_C::LUA_OK
       # 运行出错
-      raise_thread_status_error(result)
+      Lua_C.raise_thread_status_error(@s, result)
     end
   end
   # 将Lua栈第i位的内容返回为Ruby对象（不从栈中弹出；不检查Lua栈是否空）
@@ -529,7 +560,7 @@ class Lua_VM
       return @cross.get_mapping(key)
     else
       # 目前暂不支持的传出类型
-      raise_unsupported_lua_type_error(t, "At stack index \##{i}.")
+      Lua_C.raise_unsupported_lua_type_error(@s, t, "At stack index \##{i}.")
     end
   end
   # 当前栈内对象数量
@@ -593,26 +624,6 @@ class Lua_VM
     call(1, 1)
   end
 
-  # 由于Lua到Ruby类型转换错误而抛出异常
-  def raise_unsupported_lua_type_error(value, extra_msg=nil)
-    type_enum_name = Lua_C::BASIC_TYPES.find {
-      |s| Lua_C.const_get(s) == value
-    } || "Unknown Type #{value}"
-    msg = "Error: Lua type not supported for Ruby, type enum is #{type_enum_name}."
-    msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
-    raise msg
-  end
-  # 由于编译或运行错误而抛出异常
-  # 会把栈顶对象当作错误信息，并将其从栈中弹出
-  def raise_thread_status_error(value, extra_msg=nil)
-    err_enum_name = Lua_C::THREAD_STATUSES.find {
-      |s| Lua_C.const_get(s) == value
-    } || "Unknown Error #{value}"
-    msg = "Error: Lua code failed to compile or run, error enum is #{err_enum_name},\n"
-    msg += "message is #{pop}."
-    msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
-    raise msg
-  end
   # 关闭Lua虚拟机，释放空间
   def close
     Lua_C.close(@s)
