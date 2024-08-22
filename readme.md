@@ -69,6 +69,7 @@ Lua | Ruby
 - 在Lua中，数字只有一种数据类型`number`；转换到Ruby时，所有的`number`都转换为`Float`类型成为浮点数小数，即使内容可能原本是整数
 - Lua的`table`,`function`,`userdata`类型来到Ruby后，按引用传递，变成`Lua_WrappedObject`类型指向Ruby中原对象；其上的方法具体见下面API
 - Ruby的`Array`,`Hash`,`Method`,`Proc`,`Object`类型来到Lua后，按引用传递，变成`table(+metatable)`形式指向Ruby中原对象；可以在其上调用方法，具体见下面API
+- 跨语言按引用传递对象后，对象的引用会被一直保留（以防止在用到之前就被原语言环境回收），所以在用完这些引用后建议调用`Lua#release`取消引用，以重新允许垃圾回收机制回收这些对象
 - 原本来自Lua的对象来到Ruby后返回Lua，或者原本来自Ruby的对象来到Lua后返回Ruby，都能正确保持引用，可以用Lua中的`==`或Ruby中的`equals?`判断相等
 
 ## API
@@ -80,6 +81,7 @@ Lua | Ruby
 - `Lua#eval(code, *args)`：执行一段Lua代码，args传递给代码块的`...`变量，返回一个包含有各返回值的Array
 - `Lua#eval_with_buffer(code, rets_buffer, *args)`：执行一段Lua代码，args传递给代码块的`...`变量，返回值使用rets_buffer接收，避免每次调用Lua的时候都重复为返回值创建Array，从而改善性能；rets_buffer的大小表示接受返回值的个数，个数超出容量时丢弃溢出部分，个数不足容量时用nil补足
 - `Lua#close`, `Lua#dispose`：结束使用并销毁Lua虚拟机，清除并失去所有状态，例如在关闭游戏时可以使用
+- `Lua#release(obj)`：取消跨语言对象的引用；重新允许垃圾回收机制回收这个对象
 
 ### Ruby中：`class Lua_WrappedObject`
 

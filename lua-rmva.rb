@@ -309,7 +309,7 @@ end
 function rgss.class.test_eq_on_ruby_obj(ruby_obj1, ruby_obj2)
   local data1 = getmetatable(ruby_obj1)[_RUBY_OBJ_KEY]
   local data2 = getmetatable(ruby_obj2)[_RUBY_OBJ_KEY]
-  return data1.key == data2.key
+  return data1.id == data2.id
 end
 function rgss.class.tostring_on_ruby_obj(ruby_obj)
   local data = getmetatable(ruby_obj)[_RUBY_OBJ_KEY]
@@ -478,9 +478,6 @@ EOF
       return key
     end
   end
-  def release_lua_obj(obj)
-    # TODO
-  end
   def get_or_appoint_key_of_ruby_obj(obj, type_str)
     if @reverse.has_key?(obj)
       # 已经有分配好的引用键：返回已经分配好的引用键
@@ -511,8 +508,34 @@ EOF
       return key
     end
   end
-  def release_ruby_obj(obj) 
-    # TODO
+  # 对来自Lua或Ruby的对象，找到其引用键并取消对应的引用，以便于两语言各自回收对应的引用
+  # 取消引用键后，对象不能再跨语言调用方法
+  # 如果还想重新跨语言调用方法的话，需要重新从对方语言传递过来对象，以重新分配引用键和生成新的包装对象
+  def release_obj(obj)
+    # 不存在引用键：返回false
+    return false if @reverse[obj] == nil
+    # 存在引用键
+    key = @reverse[obj]
+    # 在Lua中取消引用
+    Lua_C.pushnumber(@s, key)         # <1>=key
+    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <2>=`LUA_REGISTRY`["lua-rmva"]
+    Lua_C.getfield(@s, -1, 'mapping') # <3>=`mapping`
+    Lua_C.pushvalue(@s, -3)           # <4>=<1>key
+    Lua_C.gettable(@s, -2)            # <4>=<3>`mapping`.[<4>key] 即obj
+    Lua_C.insert(@s, -3)              # <4>=`mapping`, <3>=`LUA_REGISTRY`["lua-rmva"], <2>=obj
+    Lua_C.pushvalue(@s, -4)           # <5>=<1>key
+    Lua_C.pushnil(@s)                 # <6>=nil
+    Lua_C.settable(@s, -3)            # <4>`mapping`.[<5>key] = <6>nil
+    Lua_C.settop(@s, -2)
+    Lua_C.getfield(@s, -1, 'reverse') # <4>=`reverse`
+    Lua_C.pushvalue(@s, -3)           # <5>=<2>obj
+    Lua_C.pushnil(@s)                 # <6>=nil
+    Lua_C.settable(@s, -3)            # <4>`reverse`.[<5>obj] = <6>nil
+    Lua_C.settop(@s, -5)
+    # 在Ruby中取消引用
+    @reverse.delete(obj)
+    @mapping.delete(key)
+    return true
   end
 
   # 将Ruby值推上Lua栈
@@ -613,7 +636,7 @@ EOF
     push_ruby(result)                     # <4>=result
     Lua_C.setfield(@s, -3, '___get') # 赋值<2>`rgss`.["___get"]=<4>result, 弹出<4>
     Lua_C.settop(@s, -4)
-    release_lua_obj(request)
+    release_obj(request)
   end
 
   # 处理Lua发起的Ruby调用，对指定对象调用其方法
@@ -654,8 +677,8 @@ EOF
     push_ruby(result)                     # <4>=result
     Lua_C.setfield(@s, -3, '___get') # 赋值<2>`rgss`.["___get"]=<4>result，弹出<4>
     Lua_C.settop(@s, -4)
-    release_lua_obj(argv)
-    release_lua_obj(request)
+    release_obj(argv)
+    release_obj(request)
   end
 
 end
@@ -983,6 +1006,11 @@ class Lua
   # 个数超出容量时丢弃溢出部分，个数不足容量时用nil补足
   def eval_with_buffer(code, rets_buffer, *args)
     @lua.call_full(:push_code, code, rets_buffer, args)
+  end
+
+  # 取消跨语言对象的引用；重新允许垃圾回收机制回收这个对象
+  def release(obj)
+    @lua.cross.release_obj(obj)
   end
 
   # 结束使用并销毁Lua虚拟机，清除并失去所有状态，例如在关闭游戏时可以使用
