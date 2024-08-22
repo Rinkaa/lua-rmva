@@ -192,7 +192,7 @@ end
 # 为跨语言界面的对象提供引用管理
 # 跨语言时，为对象分配引用键，引用键相同的对象为同一对象
 # 引用键对应的对象在两语言环境中可以有不同表示，但在一侧的修改会跨语言界面传到另一侧
-class Lua_CrossBoundaryReferenceManager
+class Lua_CrossBoundaryManager
 
   def initialize(lua_state)
     @s = lua_state
@@ -336,9 +336,28 @@ class Lua_CrossBoundaryReferenceManager
     # TODO
   end
 
+  # 将Ruby值推上Lua栈
+  # 出现不支持的类型时，抛出异常
+  def push_ruby(x)
+    if x == nil
+      Lua_C.pushnil(@s)
+    elsif x == false
+      Lua_C.pushboolean(@s, 0)
+    elsif x == true
+      Lua_C.pushboolean(@s, 1)
+    elsif x.is_a?(Numeric)
+      Lua_C.pushnumber(@s, x)
+    elsif x.is_a?(String)
+      Lua_C.pushstring(@s, x)
+    else
+      # 当前暂不支持的传入类型
+      raise "Error: Ruby type not supported for Lua, val is #{x}, class is #{x.class}"
+    end
+  end
   # 将对应引用键的对象推上栈，适用于要对对象进行操作时
   # 不检查对应对象是否存在
-  def push(key)
+  # 如果只是临时使用，操作结束后记得调用pop
+  def push_key(key)
     Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
     Lua_C.getfield(@s, -1, 'mapping') # <2>=`mapping`
     Lua_C.pushnumber(@s, key)         # <3>=key
@@ -346,17 +365,34 @@ class Lua_CrossBoundaryReferenceManager
     Lua_C.insert(@s, -3)              # <1>=<3>obj
     Lua_C.settop(@s, -3)
   end
-  # 将位于idx的对象的来源标识推上栈
-  # 适用于要对来源进行操作（比如检查其是"lua"还是"ruby"，还是nil）时
-  def push_source(idx)
-    len = Lua_C.gettop(@s)
-    idx = len + 1 + idx if idx < 0
-    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
-    Lua_C.getfield(@s, -1, 'source') # <2>=`source`
-    Lua_C.pushvalue(@s, idx)         # <3>=<idx>obj
-    Lua_C.gettable(@s, -2)           # <3>=<2>`source`.[<3>obj] 即"lua"|"ruby"|nil
-    Lua_C.insert(@s, -3)             # <1>=<3>"lua"|"ruby"|nil
-    Lua_C.settop(@s, -3)
+  # 将位于idx的内容返回为Ruby对象（不从栈中弹出；不检查Lua栈是否空）
+  def get_ruby(idx=-1)
+    t = Lua_C.type(@s, idx)
+    if t == Lua_C::LUA_TNIL
+      return nil
+    elsif t == Lua_C::LUA_TBOOLEAN
+      return (Lua_C.toboolean(@s, idx) != 0)
+    elsif t == Lua_C::LUA_TNUMBER
+      return Lua_C.tonumber(@s, idx)
+    elsif t == Lua_C::LUA_TSTRING
+      return Lua_C.tolstring(@s, idx, 0).force_encoding(__ENCODING__)
+    elsif
+      t == Lua_C::LUA_TTABLE \
+      || t == Lua_C::LUA_TFUNCTION \
+      || t == Lua_C::LUA_TUSERDATA \
+      || t == Lua_C::LUA_TLIGHTUSERDATA
+      key = get_key_of_lua_obj(i)
+      if key==nil
+        key = appoint_key_of_lua_obj(
+          i, t,
+          lambda {|key, type| return Lua_WrappedObject.new(self, key, type)}
+        )
+      end
+      return get_mapping(key)
+    else
+      # 目前暂不支持的传出类型
+      Lua_C.raise_unsupported_lua_type_error(@s, t, "At stack index \##{i}.")
+    end
   end
   # 舍弃栈顶，适用于结束操作时
   def pop(n=1)
@@ -394,31 +430,31 @@ class Lua_WrappedObject
   # 视为table，访问其元素
   def [](x)
     # TODO: 异常处理
-    @lua.cross_boundary.push(@key)
-    @lua.push(x)
+    @lua.cross.push_key(@key)
+    @lua.cross.push_ruby(x)
     @lua.tget
-    result = @lua.pop
-    @lua.cross_boundary.pop
+    result = @lua.cross.get_ruby
+    @lua.cross.pop(2)
     return result
   end
   alias :get :[]
   # 视为table，设置其元素
   def []=(x, val)
     # TODO: 异常处理
-    @lua.cross_boundary.push(@key)
-    @lua.push(x)
-    @lua.push(val)
+    @lua.cross.push_key(@key)
+    @lua.cross.push_ruby(x)
+    @lua.cross.push_ruby(val)
     @lua.tset
-    @lua.cross_boundary.pop
+    @lua.cross.pop(1)
   end
   alias :set :[]=
   # 转换为字符串
   def to_s
     # TODO: 异常处理
-    @lua.cross_boundary.push(@key)
+    @lua.cross.push_key(@key)
     @lua.tostring(-1)
-    result = @lua.pop
-    @lua.cross_boundary.pop
+    result = @lua.cross.get_ruby
+    @lua.cross.pop(2)
     return result
   end
   alias :tostring :to_s
@@ -445,7 +481,7 @@ class Lua_VM
   def initialize
     raise 'Lua DLL is not yet loaded!' if not Lua_C.loaded?
     @s = Lua_C.newstate  # s = state
-    @cross = Lua_CrossBoundaryReferenceManager.new(@s)
+    @cross = Lua_CrossBoundaryManager.new(@s)
   end
 
   # 跨语言界面
@@ -462,20 +498,7 @@ class Lua_VM
   # 将Ruby对象推上Lua栈
   # 出现不支持的类型时，抛出异常
   def push(x)
-    if x == nil
-      Lua_C.pushnil(@s)
-    elsif x == false
-      Lua_C.pushboolean(@s, 0)
-    elsif x == true
-      Lua_C.pushboolean(@s, 1)
-    elsif x.is_a?(Numeric)
-      Lua_C.pushnumber(@s, x)
-    elsif x.is_a?(String)
-      Lua_C.pushstring(@s, x)
-    else
-      # 当前暂不支持的传入类型
-      raise "Error: Ruby type not supported for Lua, val is #{x}, class is #{x.class}"
-    end
+    @cross.push_ruby(x)
   end
   # 将多个Ruby对象推上Lua栈
   # 出现不支持的类型时，抛出异常，并弹出先前所推上的对象以保证退回原来的状态
@@ -523,32 +546,7 @@ class Lua_VM
   # 将Lua栈第i位的内容返回为Ruby对象（不从栈中弹出；不检查Lua栈是否空）
   # i为1表示栈底；-1时表示栈顶，-2时表示从顶向底第二位，以此类推
   def get(i=-1)
-    t = Lua_C.type(@s, i)
-    if t == Lua_C::LUA_TNIL
-      return nil
-    elsif t == Lua_C::LUA_TBOOLEAN
-      return (Lua_C.toboolean(@s, i) != 0)
-    elsif t == Lua_C::LUA_TNUMBER
-      return Lua_C.tonumber(@s, i)
-    elsif t == Lua_C::LUA_TSTRING
-      return Lua_C.tolstring(@s, i, 0).force_encoding(__ENCODING__)
-    elsif
-      t == Lua_C::LUA_TTABLE \
-      || t == Lua_C::LUA_TFUNCTION \
-      || t == Lua_C::LUA_TUSERDATA \
-      || t == Lua_C::LUA_TLIGHTUSERDATA
-      key = @cross.get_key_of_lua_obj(i)
-      if key==nil
-        key = @cross.appoint_key_of_lua_obj(
-          i, t,
-          lambda {|key, type| return Lua_WrappedObject.new(self, key, type)}
-        )
-      end
-      return @cross.get_mapping(key)
-    else
-      # 目前暂不支持的传出类型
-      Lua_C.raise_unsupported_lua_type_error(@s, t, "At stack index \##{i}.")
-    end
+    @cross.get_ruby(i)
   end
   # 当前栈内对象数量
   def length
