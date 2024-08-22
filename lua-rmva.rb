@@ -186,24 +186,35 @@ end
 # 引用键对应的对象在两语言环境中可以有不同表示，但在一侧的修改会跨语言界面传到另一侧
 class Lua_CrossBoundaryManager
 
-  def initialize(lua_state)
+  def initialize(lua_state, lua_object_wrapper, ruby_object_wrap_and_pusher)
+    # 指定所用的Lua状态机
     @s = lua_state
+    # 初始化跨语言界面引用的存储容器
+    _init_ref_holders
+    # 初始化跨语言界面调用的设施
+    _init_cross_call_utils
+    # 发生lua->ruby跨界面对象传递时，如何包装lua对象
+    @lua_object_wrapper = lua_object_wrapper
+    # 发生ruby->lua跨界面对象传递时，如何包装ruby对象
+    @ruby_object_wrap_and_pusher = ruby_object_wrap_and_pusher
+  end
+
+  # 初始化引用保留设施
+  def _init_ref_holders
     # Lua侧的引用保留表示形式：
     #   `LUA_REGISTRY`["lua-rmva"]["mapping"] = {}  -- 正查（[key] = obj）
     #   `LUA_REGISTRY`["lua-rmva"]["reverse"] = {}  -- 反查（[obj] = key）
-    #   `LUA_REGISTRY`["lua-rmva"]["source"] = {}   -- 记录对象最初由哪侧创建（[obj] = "lua"|"ruby"）
     Lua_C.createtable(@s, 0, 4)
     Lua_C.pushvalue(@s, -1)
     Lua_C.setfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva')
-    for word in ['mapping', 'reverse', 'source']
-      Lua_C.createtable(@s, 0, 0)
-      Lua_C.setfield(@s, -2, word)
-    end
+    Lua_C.createtable(@s, 0, 0)
+    Lua_C.setfield(@s, -2, 'mapping')
+    Lua_C.createtable(@s, 0, 0)
+    Lua_C.setfield(@s, -2, 'reverse')
     Lua_C.settop(@s, -2)
     # Ruby侧的引用保留表示形式：
     @mapping = Hash.new  # 正查（key => obj）
     @reverse = Hash.new  # 反查（obj => key）
-    @source = Hash.new   # 记录对象最初由哪侧创建（obj => :lua|:ruby）
     # 引用键顺序
     @next_key = 1
     @next_key_max = 1000000000 # 需要在double转换到int时能良好转换，所以需要设最大值
@@ -215,8 +226,199 @@ class Lua_CrossBoundaryManager
   def get_reverse(obj)
     @reverse[obj]
   end
-  def get_source(key)
-    @source[key]
+
+  # 初始化跨界面调用设施
+  def _init_cross_call_utils
+    # Lua侧的调用Ruby设施形式：（通过require("rgss")访问）
+    #   `LUA_REGISTRY`["lua-rmva"]["rgss"]  -- 从Registry快速访问这个模块的方式
+    #                                    -- （注意，这个模块没有反过来指向Registry的引用）
+    #   `rgss`.___post  -- Lua通知Ruby从Lua获取对象时，作为中转的存放位置
+    #   `rgss`.___get   -- Lua通知Ruby向Lua发送对象时，作为中转的存放位置
+    #   `rgss`.dll.RGSSEval  -- 执行一段Ruby代码，无参数，无返回值
+    #   `rgss`.eval          -- 执行一段Ruby代码，无参数，取得返回值
+    #   `rgss`.call          -- 对来自Ruby的对象使用，调用其方法，并取得返回值
+    #   `rgss`.class.Object -- 来自Ruby的对象的通用包装
+    #   `rgss`.class.Array  -- 来自Ruby的Array对象的便捷包装
+    #   `rgss`.class.Hash   -- 来自Ruby的Hash对象的便捷包装
+    #   `rgss`.class.Method -- 来自Ruby的Method对象的便捷包装
+    #   `rgss`.class.Proc   -- 来自Ruby的Proc对象的便捷包装
+    #   `rgss`.is_ruby_object   -- 对象是否是来自Ruby的对象
+    #   `rgss`.error_handler    -- 错误发生时对错误信息的包装（例如加入调用栈信息）
+    # 建立Lua侧的rgss模块，用Lua写成`rgss`.call`, rgss`.eval, `rgss`.class
+    lua_rgss_module_code = <<-EOF
+-- lua_rgss_module
+local rgss = {}
+
+-- 加载RGSS3中的函数
+local ffi = require "ffi"
+  -- 在Ruby中替换此@@@模板参数为当时的addr
+rgss.dll = {}
+rgss.dll.RGSSEval = ffi.cast("int(*)(const char*)", @@@RGSSEval_addr@@@)
+
+-- 顶层实用函数
+function rgss.eval(code)
+  -- TODO: RGSSEval异常处理
+  local request = {
+    code = code,
+  }
+  rgss.___post = request
+  local eval_return_code = rgss.dll.RGSSEval([[
+    # ruby
+      # 在Ruby中替换此@@@模板参数为当时的id
+    cross = ObjectSpace._id2ref(@@@CrossManager_object_id@@@)
+    cross.handle_eval_request
+  ]])
+  rgss.___post = nil
+  local result = rgss.___get
+  rgss.___get = nil
+  return result
+end
+function rgss.call(receiver_object_key, signal_name, ...)
+  -- TODO: RGSSEval异常处理
+  local request = {
+    key = receiver_object_key,
+    name = signal_name,
+    argc = select("#", ...),
+    argv = {...},
+  }
+  rgss.___post = request
+  local eval_return_code = rgss.dll.RGSSEval([[
+    # ruby
+    # 在Ruby控制Lua运行此lua_rgss_module代码前替换此@@@模板参数为当时的id
+    cross = ObjectSpace._id2ref(@@@CrossManager_object_id@@@)
+    cross.handle_call_request
+  ]])
+  rgss.___post = nil
+  local result = rgss.___get
+  rgss.___get = nil
+  return result
+end
+
+-- 包装Ruby对象的函数
+rgss.class = {}
+local _RUBY_OBJ_KEY = {}
+function rgss.class.write_to_ruby_obj(ruby_obj, k, v)
+  msg = "This operation is not permitted!\\n"
+  msg = msg .. "If you want to write to a hash, use `hash:set(key, value)` instead."
+  error(msg)
+end
+function rgss.class.call_on_ruby_obj(ruby_obj, signal_name, ...)
+  local data = getmetatable(ruby_obj)[_RUBY_OBJ_KEY]
+  return rgss.call(data.key, signal_name, ...)
+end
+function rgss.class.test_eq_on_ruby_obj(ruby_obj1, ruby_obj2)
+  local data1 = getmetatable(ruby_obj1)[_RUBY_OBJ_KEY]
+  local data2 = getmetatable(ruby_obj2)[_RUBY_OBJ_KEY]
+  return data1.key == data2.key
+end
+function rgss.class.tostring_on_ruby_obj(ruby_obj)
+  local data = getmetatable(ruby_obj)[_RUBY_OBJ_KEY]
+  return string.format(
+    "<RubyObject, key=%s, id=%s, type_hint=%s>",
+      tostring(data.key),
+      tostring(data.id),
+      tostring(data.type_hint)
+    )
+end
+function rgss.class.Object(key, object_id, methods, type_hint)
+  return setmetatable({}, {
+    [_RUBY_OBJ_KEY] = { -- metatable中有这个键值对说明是跨语言界面对象
+      key = key,        -- 引用键
+      id = object_id,   -- Ruby中对象的id，通过Object#object_id得到
+      type_hint = type_hint or "Object", -- 在Ruby中的大致类型（需要包装方法支持）
+    },
+    __eq = rgss.class.test_eq_on_ruby_obj,
+    __tostring = rgss.class.tostring_on_ruby_obj,
+    __call = rgss.class.call_on_ruby_obj,
+    __index = methods or {},
+    __newindex = rgss.class.write_to_ruby_obj,
+  })
+end
+local common_functions = {
+  length = function(self) return rgss.class.call_on_ruby_obj(self, "length") end,
+  bracket_get = function(self, k) return rgss.class.call_on_ruby_obj(self, "[]", k) end,
+  bracket_set = function(self, k, v) return rgss.class.call_on_ruby_obj(self, "[]=", k, v) end,
+  clear = function(self) return rgss.class.call_on_ruby_obj(self, "clear") end,
+  has_key = function(self, k) return rgss.class.call_on_ruby_obj(self, "has_key?", k) end,
+  has_value = function(self, v) return rgss.class.call_on_ruby_obj(self, "has_value?", v) end,
+  call = function(self, ...) return rgss.class.call_on_ruby_obj(self, "call", ...) end,
+}
+local array_functions = {
+  length = common_functions.length,
+  size = common_functions.length,
+  get = common_functions.bracket_get,
+  set = common_functions.bracket_set,
+  bracket_get = common_functions.bracket_get,
+  bracket_set = common_functions.bracket_set,
+}
+local hash_functions = {
+  length = common_functions.length,
+  size = common_functions.size,
+  get = common_functions.bracket_get,
+  set = common_functions.bracket_set,
+  bracket_get = common_functions.bracket_get,
+  bracket_set = common_functions.bracket_set,
+  has_key = common_functions.has_key,
+  has_value = common_functions.has_value,
+  include = common_functions.has_key,
+  index = function(self, v) return rgss.class.call_on_ruby_obj(self, "index", v) end,
+  keys = function(self) return rgss.class.call_on_ruby_obj(self, "keys") end,
+  values = function(self) return rgss.class.call_on_ruby_obj(self, "values") end,
+}
+local method_functions = {
+  call = common_functions.call,
+}
+local proc_functions = {
+  call = common_functions.call,
+}
+function rgss.class.Array(key, object_id)
+  return rgss.class.Object(key, object_id, array_functions, "Array")
+end
+function rgss.class.Hash(key, object_id)
+  return rgss.class.Object(key, object_id, hash_functions, "Hash")
+end
+function rgss.class.Method(key, object_id)
+  return rgss.class.Object(key, object_id, method_functions, "Method")
+end
+function rgss.class.Proc(key, object_id)
+  return rgss.class.Object(key, object_id, proc_functions, "Proc")
+end
+
+-- 判断对象是否是ruby对象
+function rgss.is_ruby_object(x)
+  return not not (type(x)=="table" and getmetatable(x)[_RUBY_OBJ_KEY])
+end
+-- 发生错误时包装错误
+-- TODO: 把error_handler放在Lua_CrossBoundaryManager有点不妥当，之后需要移动到Lua_VM类下
+function rgss.error_handler(err)
+  return debug.traceback(tostring(err), 1)
+end
+
+package.loaded["rgss"] = rgss
+return rgss
+EOF
+    # 替换模板参数
+    _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
+    _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
+    _RGSSEval_addr = _GetProcAddress.(_GetModuleHandle.('RGSS301.dll'), 'RGSSEval')
+    lua_rgss_module_code.sub!('@@@RGSSEval_addr@@@', _RGSSEval_addr.to_s)
+    lua_rgss_module_code.sub!('@@@CrossManager_object_id@@@', object_id.to_s) 
+    lua_rgss_module_code.sub!('@@@CrossManager_object_id@@@', object_id.to_s)
+    # 估值Lua代码并将其挂载到Registry
+    load_result = Lua_C.loadstring(@s, lua_rgss_module_code)
+    if load_result != Lua_C::LUA_OK || Lua_C.type(@s, -1) != Lua_C::LUA_TFUNCTION
+      # 编译出错
+      Lua_C.raise_thread_status_error(@s, load_result, "Code is: |\n#{lua_rgss_module_code}") 
+    end
+    run_result = Lua_C.pcall(@s, 0, 1, 0) # <1>=`rgss`
+    if run_result != Lua_C::LUA_OK
+      # 模块定义代码运行出错
+      Lua_C.raise_thread_status_error(@s, run_result, "Code is: |\n#{lua_rgss_module_code}") 
+    end
+    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <2>=`LUA_REGISTRY`["lua-rmva"]
+    Lua_C.pushvalue(@s, -2)        # <3>=<1>`rgss`
+    Lua_C.setfield(@s, -2, 'rgss') # <2>`LUA_REGISTRY`["lua-rmva"].["rgss"]=<3>`rgss`
+    Lua_C.settop(@s, -3)
   end
 
   def _generate_new_key
@@ -232,77 +434,63 @@ class Lua_CrossBoundaryManager
   end
   private :_generate_new_key
 
-  # 取得lua栈中idx处对象的引用键，不存在时返回nil
-  def get_key_of_lua_obj(idx)
+  # 取得lua栈中idx处对象的引用键，不存在时为其分配新引用键；返回引用键
+  def get_or_appoint_key_of_lua_obj(idx, type_enum)
     len = Lua_C.gettop(@s)
     idx = len + 1 + idx if idx < 0
     # TODO: 异常处理
+    # 查看是否存在引用键
     Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
     Lua_C.getfield(@s, -1, 'reverse')  # <2>=`reverse`
     Lua_C.pushvalue(@s, idx)           # <3>=<idx>obj
     Lua_C.gettable(@s, -2)             # <3>=<2>`reverse`.[<3>obj] 即key
     if Lua_C.type(@s, -1) != Lua_C::LUA_TNIL
+      # 已经有分配好的引用键：返回已经分配好的引用键
       key = Lua_C.tonumber(@s, -1).to_i
       Lua_C.settop(@s, -4)
       return key
     else
+      # 没有分配好的引用键，所以创建新的引用键
+      key = _generate_new_key
+      # 在Lua侧注册引用键并保持引用
+      Lua_C.settop(@s, -2)
+      Lua_C.pushnumber(@s, key)  # <3>=key
+      Lua_C.insert(@s, -2)       # <3>=<2>`reverse`, <2>=<3>key
+      Lua_C.pushvalue(@s, idx)   # <4>=<idx>obj
+      Lua_C.pushvalue(@s, -3)    # <5>=<2>key
+      Lua_C.settable(@s, -3)     # <3>`reverse`.[<4>obj] = <5>key
+      Lua_C.settop(@s, -2)
+      Lua_C.getfield(@s, -2, 'mapping') # <3>=`mapping`
+      Lua_C.pushvalue(@s, -2)           # <4>=<2>key
+      Lua_C.pushvalue(@s, idx)          # <5>=<idx>obj
+      Lua_C.settable(@s, -3)            # <3>`mapping`.[<4>key] = <5>obj
       Lua_C.settop(@s, -4)
-      return nil
+      # 在Ruby侧创建包装对象
+      wrapped_lua_obj = @lua_object_wrapper.(key, type_enum)
+      # 在Ruby侧注册引用键并保持引用
+      @reverse[wrapped_lua_obj] = key
+      @mapping[key] = wrapped_lua_obj
+      # 返回新创建的引用键
+      return key
     end
   end
-  # 为lua栈中idx处对象设置新引用键
-  # 注意：不检查对象的引用键是否已经存在，而对已经存在引用键的对象再指定新引用键会导致内存泄露
-  # 请务必先用get_key_of_lua_obj获得现有的引用键并查看是否为nil！
-  def appoint_key_of_lua_obj(idx, lua_obj_type, lua_obj_wrapper)
-    key = _generate_new_key
-    len = Lua_C.gettop(@s)
-    idx = len + 1 + idx if idx < 0
-    # TODO: 异常处理
-    # 在Lua侧注册引用键并保持引用
-    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
-    Lua_C.getfield(@s, -1, 'reverse')  # <2>=`reverse`
-    Lua_C.pushnumber(@s, key)  # <3>=key
-    Lua_C.insert(@s, -2)       # <3>=<2>`reverse`, <2>=<3>key
-    Lua_C.pushvalue(@s, idx)   # <4>=<idx>obj
-    Lua_C.pushvalue(@s, -3)    # <5>=<2>key
-    Lua_C.settable(@s, -3)     # <3>`reverse`.[<4>obj] = <5>key
-    Lua_C.settop(@s, -2)
-    Lua_C.getfield(@s, -2, 'mapping') # <3>=`mapping`
-    Lua_C.pushvalue(@s, -2)           # <4>=<2>key
-    Lua_C.pushvalue(@s, idx)          # <5>=<idx>obj
-    Lua_C.settable(@s, -3)            # <3>`mapping`.[<4>key] = <5>obj
-    Lua_C.settop(@s, -2)
-    Lua_C.getfield(@s, -2, 'source') # <3>=`source`
-    Lua_C.pushvalue(@s, idx)         # <4>=<idx>obj
-    Lua_C.pushstring(@s, 'lua')      # <5>="lua"
-    Lua_C.settable(@s, -3)           # <3>`source`.[<4>obj] = <5>"lua"
-    Lua_C.settop(@s, -4)
-    # 在Ruby侧创建包装对象
-    wrapped_lua_obj = lua_obj_wrapper.(key, lua_obj_type)
-    # 在Ruby侧注册引用键并保持引用
-    @reverse[wrapped_lua_obj] = key
-    @mapping[key] = wrapped_lua_obj
-    @source[wrapped_lua_obj] = :lua
-    # 返回新创建的引用键
-    return key
-  end
-  def release_lua_obj(stack, idx)
+  def release_lua_obj(obj)
     # TODO
   end
-  def get_or_appoint_key_of_ruby_obj(obj, type_sym, ruby_obj_wrap_and_pusher)
-    if reverse.has_key?(obj)
+  def get_or_appoint_key_of_ruby_obj(obj, type_str)
+    if @reverse.has_key?(obj)
       # 已经有分配好的引用键：返回已经分配好的引用键
-      return reverse[obj]
+      return @reverse[obj]
     else
       # 没有分配好的引用键，所以创建新的引用键
       key = _generate_new_key
       # 在Ruby侧注册引用键并保持引用
       @reverse[obj] = key
       @mapping[key] = obj
-      @source[obj] = :ruby
       # 在Lua侧创建包装对象
-      ruby_obj_wrap_and_pusher.(obj, type_sym) # <1>=obj
+      @ruby_object_wrap_and_pusher.(key, obj.object_id, type_str) # <1>=obj
       # 在Lua侧注册引用键并保持引用
+      # TODO: 异常处理
       Lua_C.pushnumber(@s, key)               # <2>=key
       Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <3>=`LUA_REGISTRY`["lua-rmva"]
       Lua_C.getfield(@s, -1, 'reverse') # <4>=`reverse`
@@ -314,11 +502,6 @@ class Lua_CrossBoundaryManager
       Lua_C.pushvalue(@s, -3)           # <5>=<2>key
       Lua_C.pushvalue(@s, -5)           # <6>=<1>obj
       Lua_C.settable(@s, -3)            # <4>`mapping`.[<5>key] = <6>obj
-      Lua_C.settop(@s, -2)
-      Lua_C.getfield(@s, -1, 'source') # <4>=`source`
-      Lua_C.pushvalue(@s, -4)          # <5>=<1>obj
-      Lua_C.pushstring(@s, 'ruby')     # <6>="ruby"
-      Lua_C.settable(@s, -3)           # <4>`source`.[<5>obj] = <6>"ruby"
       Lua_C.settop(@s, -5)
       # 返回新创建的引用键
       return key
@@ -341,6 +524,24 @@ class Lua_CrossBoundaryManager
       Lua_C.pushnumber(@s, x)
     elsif x.is_a?(String)
       Lua_C.pushstring(@s, x)
+    elsif x.is_a?(Array)
+      key = get_or_appoint_key_of_ruby_obj(x, 'Array')
+      push_key(key)
+    elsif x.is_a?(Hash)
+      key = get_or_appoint_key_of_ruby_obj(x, 'Hash')
+      push_key(key)
+    elsif x.is_a?(Method)
+      key = get_or_appoint_key_of_ruby_obj(x, 'Method')
+      push_key(key)
+    elsif x.is_a?(Proc)
+      key = get_or_appoint_key_of_ruby_obj(x, 'Proc')
+      push_key(key)
+    elsif x.is_a?(Lua_WrappedObject)
+      # 从Lua来的对象就直接用引用键还原引用
+      push_key(x.key)
+    elsif x.is_a?(Object)
+      key = get_or_appoint_key_of_ruby_obj(x, 'Object')
+      push_key(key)
     else
       # 当前暂不支持的传入类型
       raise "Error: Ruby type not supported for Lua, val is #{x}, class is #{x.class}"
@@ -355,6 +556,15 @@ class Lua_CrossBoundaryManager
     Lua_C.pushnumber(@s, key)         # <3>=key
     Lua_C.gettable(@s, -2)            # <3>=<2>`mapping`.[<3>key] 即obj
     Lua_C.insert(@s, -3)              # <1>=<3>obj
+    Lua_C.settop(@s, -3)
+  end
+  # 将`rgss`定义中的`rgss`.error_handler推上栈
+  # TODO: 把error_handler放在Lua_CrossBoundaryManager有点不妥当，之后需要移动到Lua_VM类下
+  def push_error_handler
+    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva')
+    Lua_C.getfield(@s, -1, 'rgss')
+    Lua_C.getfield(@s, -1, 'error_handler')
+    Lua_C.insert(@s, -3)
     Lua_C.settop(@s, -3)
   end
   # 将位于idx的内容返回为Ruby对象（不从栈中弹出；不检查Lua栈是否空）
@@ -373,14 +583,9 @@ class Lua_CrossBoundaryManager
       || t == Lua_C::LUA_TFUNCTION \
       || t == Lua_C::LUA_TUSERDATA \
       || t == Lua_C::LUA_TLIGHTUSERDATA
-      key = get_key_of_lua_obj(i)
-      if key==nil
-        key = appoint_key_of_lua_obj(
-          i, t,
-          lambda {|key, type| return Lua_WrappedObject.new(self, key, type)}
-        )
-      end
-      return get_mapping(key)
+      # 同时也考虑进去了发过去的对象正好是来自ruby的对象的可能性
+      key = get_or_appoint_key_of_lua_obj(idx, t)
+      return @mapping[key]
     else
       # 目前暂不支持的传出类型
       Lua_C.raise_unsupported_lua_type_error(@s, t, "At stack index \##{i}.")
@@ -391,12 +596,64 @@ class Lua_CrossBoundaryManager
     Lua_C.settop(@s, -n-1)
   end
 
-  def push_array(stack, array)
+  # 处理Lua发起的Ruby调用，执行一段代码
+  # 从`rgss`.___post读取调用信息，并把结果写到`rgss`.___get
+  def handle_eval_request
+    # TODO: 异常处理
+    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
+    Lua_C.getfield(@s, -1, 'rgss')    # <2>=`rgss`
+    Lua_C.getfield(@s, -1, '___post') # <3>=`___post`
+    request = get_ruby(-1)
+    code = request.get('code')
+    result = eval(code)
+    push_ruby(result)                     # <4>=result
+    Lua_C.setfield(@s, -3, '___get') # 赋值<2>`rgss`.["___get"]=<4>result, 弹出<4>
+    Lua_C.settop(@s, -4)
+    release_lua_obj(request)
   end
-  def push_hash(stack, hash)
+
+  # 处理Lua发起的Ruby调用，对指定对象调用其方法
+  # 从`rgss`.___post读取调用信息，并把结果写到`rgss`.___get
+  def handle_call_request
+    # TODO: 异常处理
+    Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
+    Lua_C.getfield(@s, -1, 'rgss')    # <2>=`rgss`
+    Lua_C.getfield(@s, -1, '___post') # <3>=`___post`
+    request = get_ruby(-1)
+    receiver_key = request.get('key').to_i
+    signal_name = request.get('name')
+    argc = request.get('argc').to_i
+    argv = request.get('argv')
+    receiver = @mapping[receiver_key]
+    result = nil
+    if argc == 0
+      result = receiver.send(signal_name)
+    elsif argc == 1
+      arg1 = argv.get(1)
+      result = receiver.send(signal_name, arg1)
+    elsif argc == 2
+      arg1 = argv.get(1)
+      arg2 = argv.get(2)
+      result = receiver.send(signal_name, arg1, arg2)
+    elsif argc == 3
+      arg1 = argv.get(1)
+      arg2 = argv.get(2)
+      arg3 = argv.get(3)
+      result = receiver.send(signal_name, arg1. arg2, arg3)
+    else
+      args = Array.new
+      for i in 1..argc
+        args[i-1] = argv.get(i)
+      end
+      result = receiver.send(signal_name, *args)
+    end
+    push_ruby(result)                     # <4>=result
+    Lua_C.setfield(@s, -3, '___get') # 赋值<2>`rgss`.["___get"]=<4>result，弹出<4>
+    Lua_C.settop(@s, -4)
+    release_lua_obj(argv)
+    release_lua_obj(request)
   end
-  def push_callable(stack, callable)
-  end
+
 end
 
 # 在Lua侧创建的对象来到Ruby时的包装类
@@ -473,7 +730,28 @@ class Lua_VM
   def initialize
     raise 'Lua DLL is not yet loaded!' if not Lua_C.loaded?
     @s = Lua_C.newstate  # s = state
-    @cross = Lua_CrossBoundaryManager.new(@s)
+    Lua_C.openlibs(@s)
+    @cross = Lua_CrossBoundaryManager.new(
+      @s,
+      lambda { |key, type_enum| return Lua_WrappedObject.new(self, key, type_enum)},
+      lambda { |key, object_id, type_str|
+        # TODO: 把error_handler放在Lua_CrossBoundaryManager有点不妥当，之后需要移动到Lua_VM类下
+        Lua_C.getfield(@s, Lua_C::LUA_REGISTRYINDEX, 'lua-rmva') # <1>=`LUA_REGISTRY`["lua-rmva"]
+        Lua_C.getfield(@s, -1, 'rgss')          # <2>`rgss`
+        Lua_C.getfield(@s, -1, 'error_handler') # <3>`rgss`.error_handler
+        Lua_C.getfield(@s, -2, 'class')         # <4>`rgss`.class
+        Lua_C.getfield(@s, -1, type_str)        # <5>`rgss`.class.XXXType
+        if Lua_C.type(@s, -1) == Lua_C::LUA_TNIL
+          # Lua侧没有匹配的包装函数：默认使用Object
+          Lua_C.settop(@s, -2)
+          Lua_C.getfield(@s, -1, 'Object')      # <5>`rgss`.class.Object
+        end
+        Lua_C.pushnumber(@s, key)       # <6>key
+        Lua_C.pushnumber(@s, object_id) # <7>object_id
+        Lua_C.pcall(@s, 2, 1, -5)       # <5>obj=xpcall(<5>`rgss`.class.XXXType, <6>key, <7>object_id; err_handler=<3>`rgss`.error_handler)
+        Lua_C.insert(@s, -5)      # <1>=<5>obj
+        Lua_C.settop(@s, -5)
+      })
   end
 
   # 跨语言界面
@@ -481,11 +759,6 @@ class Lua_VM
     @cross
   end
   alias :cross_boundary :cross
-
-  # 打开基础库（math, string, table之类）
-  def open_libs
-    Lua_C.openlibs(@s)
-  end
 
   # 将Ruby对象推上Lua栈
   # 出现不支持的类型时，抛出异常
@@ -585,16 +858,22 @@ class Lua_VM
   def call_full(code_pusher_sym, code_object, rets_buffer, args)
     # 考虑原本的栈长
     length_before = length
+    # 放上用于错误处理的error_handler
+    # TODO: 把error_handler放在Lua_CrossBoundaryManager有点不妥当，之后需要移动到Lua_VM类下
+    @cross.push_error_handler
     # 放上Lua代码块，然后放上参数
     # code_object提供内容，code_pusher_sym决定内容是视作文件名还是视作字符串
     send(code_pusher_sym, code_object)
     push_n(args)
     # 执行
     n_ret = (rets_buffer == nil) ? -1 : rets_buffer.length
-    call_instack(args.length, n_ret, 0)
+    call_instack(args.length, n_ret, length_before+1)
     # 承接返回值（多余舍弃，不足填nil）
-    n_ret = length - length_before
+    # Lua侧已返回值的实际数目应当是当前栈长减去原本栈长和错误处理
+    n_ret = length - length_before - 1
     rets_buffer = pop_n(n_ret, rets_buffer)
+    # 舍弃错误处理的error_handler
+    Lua_C.settop(@s, -2)
     return rets_buffer
   end
   # 将Lua栈第i位的内容视作table，栈顶视作key，访问table[key]
@@ -675,8 +954,7 @@ class Lua
     Lua_C.load(dll_path) if not Lua_C.loaded?
     # 创建Lua虚拟机
     @lua = Lua_VM.new
-    # 加载库和临时方案
-    @lua.open_libs
+    # 加载各个临时方案
     eval(Lua_Magics::PRINT)
     return nil
   end
