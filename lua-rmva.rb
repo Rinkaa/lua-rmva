@@ -424,28 +424,9 @@ class Lua_WrappedObject
   alias :tostring :to_s
 
   # 视为callable table / callable userdata / function，调用之
-  # Ruby调用Lua过程，可以传参和取返回值，支持多参多返回值
-  # 给定retsBuffer时使用此buffer存放返回值，或者设为nil表示新建Array存放返回值
-  def _call(rets_buffer, args)
-    # 考虑原本的栈长
-    length_before = @lua.length
-    # 放上自身作为要执行的过程，然后放上参数
-    @lua.cross_boundary.push(@key)
-    @lua.push_n(args)
-    # 执行
-    n_ret = (rets_buffer == nil) ? -1 : rets_buffer.length
-    @lua.call(args.length, n_ret)
-    # 承接返回值（多余舍弃，不足填nil）
-    # Lua侧已返回值的实际数目应当是当前栈长减去原本栈长
-    n_ret = @lua.length - length_before
-    rets_buffer = @lua.pop_n(n_ret, rets_buffer)
-    return rets_buffer
-  end
-  private :_call
-  # 视为callable table / callable userdata / function，调用之
   # 返回一个包含有各返回值的Array
   def call(*args)
-    return _call(nil, args)
+    @lua.call_full(:push_cross, @key, nil, args)
   end
   # 视为callable table / callable userdata / function，调用之
   # 返回值使用rets_buffer接收，
@@ -453,7 +434,7 @@ class Lua_WrappedObject
   # rets_buffer的大小表示接受返回值的个数，
   # 个数超出容量时丢弃溢出部分，个数不足容量时用nil补足
   def call_with_buffer(rets_buffer, *args)
-    return _call(rets_buffer, args)
+    @lua.call_full(:push_cross, @key, rets_buffer, args)
   end
 end
 
@@ -468,9 +449,10 @@ class Lua_VM
   end
 
   # 跨语言界面
-  def cross_boundary
+  def cross
     @cross
   end
+  alias :cross_boundary :cross
 
   # 打开基础库（math, string, table之类）
   def open_libs
@@ -523,11 +505,16 @@ class Lua_VM
       Lua_C.raise_thread_status_error(@s, result, "Code file is #{filename}.")
     end
   end
-  # 函数调用
-  # 上方n_args个对象依次视作参数，上方往下数n_args+1位置视为要调用的函数
+  # 将跨语言界面中指定引用键的对象推上栈
+  def push_cross(key)
+    @cross.push_key(key)
+  end
+  # 只处理Lua状态机的栈的函数调用
+  # 上方n_args个现有对象依次视作参数，上方往下数n_args+1位置视为要调用的函数
   # 之后弹出参数和函数，并试图放入n_results个返回值
-  def call(n_args, n_results)
-    result = Lua_C.pcall(@s, n_args, n_results, 0)
+  # 可以指定所用的错误处理函数（在栈中所在的位置）；默认是0即不使用
+  def call_instack(n_args, n_results, error_handler_idx=0)
+    result = Lua_C.pcall(@s, n_args, n_results, error_handler_idx)
     if result != Lua_C::LUA_OK
       # 运行出错
       Lua_C.raise_thread_status_error(@s, result)
@@ -601,6 +588,25 @@ class Lua_VM
     Lua_C.settop(@s, 0)
   end
 
+  # 包装得更完善的函数调用
+  # code_pusher_sym表示要使用此Lua_VM的哪个push_xxx方法来把要调用的函数对象推上栈，push_xxx方法接受code_object作为参数
+  # 函数使用args传递要交给Lua的参数，并且返回Lua所返回的值；都是Array类型，因此多参多返回值
+  # 给定retsBuffer时使用此buffer存放返回值，或者设为nil表示新建Array存放返回值
+  def call_full(code_pusher_sym, code_object, rets_buffer, args)
+    # 考虑原本的栈长
+    length_before = length
+    # 放上Lua代码块，然后放上参数
+    # code_object提供内容，code_pusher_sym决定内容是视作文件名还是视作字符串
+    send(code_pusher_sym, code_object)
+    push_n(args)
+    # 执行
+    n_ret = (rets_buffer == nil) ? -1 : rets_buffer.length
+    call_instack(args.length, n_ret, 0)
+    # 承接返回值（多余舍弃，不足填nil）
+    n_ret = length - length_before
+    rets_buffer = pop_n(n_ret, rets_buffer)
+    return rets_buffer
+  end
   # 将Lua栈第i位的内容视作table，栈顶视作key，访问table[key]
   # key将被弹出，并将结果value替换到栈顶
   # i为1表示栈底；-1时表示栈顶，-2时表示从顶向底第二位，以此类推
@@ -621,7 +627,7 @@ class Lua_VM
     i = len + 1 + i if i < 0
     Lua_C.getfield(@s, Lua_C::LUA_GLOBALSINDEX, 'tostring')
     Lua_C.pushvalue(@s, i)
-    call(1, 1)
+    call_instack(1, 1)
   end
 
   # 关闭Lua虚拟机，释放空间
@@ -685,36 +691,16 @@ class Lua
     return nil
   end
 
-  # Ruby调用Lua过程，可以传参和取返回值，支持多参多返回值
-  # 给定retsBuffer时使用此buffer存放返回值，或者设为nil表示新建Array存放返回值
-  def _eval_target(code_pusher_sym, code_object, rets_buffer, args)
-    # 考虑原本的栈长
-    length_before = @lua.length
-    # 放上Lua代码块，然后放上参数
-    # code_object提供内容，code_pusher_sym决定内容是视作文件名还是视作字符串
-    @lua.send(code_pusher_sym, code_object)
-    @lua.push_n(args)
-    # 执行
-    n_ret = (rets_buffer == nil) ? -1 : rets_buffer.length
-    @lua.call(args.length, n_ret)
-    # 承接返回值（多余舍弃，不足填nil）
-    # Lua侧已返回值的实际数目应当是当前栈长减去原本栈长
-    n_ret = @lua.length - length_before
-    rets_buffer = @lua.pop_n(n_ret, rets_buffer)
-    return rets_buffer
-  end
-  protected :_eval_target
-
   # 执行一个Lua文件，args传递给文件的`...`变量
   # 返回一个包含有各返回值的Array
   def eval_file(filename, *args)
-    _eval_target(:push_codefile, filename, nil, args)
+    @lua.call_full(:push_codefile, filename, nil, args)
   end
 
   # 执行一段Lua代码，args传递给代码块的`...`变量
   # 返回一个包含有各返回值的Array
   def eval(code, *args)
-    _eval_target(:push_code, code, nil, args)
+    @lua.call_full(:push_code, code, nil, args)
   end
 
   # 执行一段Lua代码，args传递给代码块的`...`变量，返回值使用rets_buffer接收
@@ -722,7 +708,7 @@ class Lua
   # rets_buffer的大小表示接受返回值的个数，
   # 个数超出容量时丢弃溢出部分，个数不足容量时用nil补足
   def eval_with_buffer(func, rets_buffer, *args)
-    _eval_target(:push_code, code, rets_buffer, args)
+    @lua.call_full(:push_code, code, rets_buffer, args)
   end
 
   # 结束使用并销毁Lua虚拟机，清除并失去所有状态，例如在关闭游戏时可以使用
