@@ -255,8 +255,8 @@ local ffi = require "ffi"
 rgss.dll = {}
 rgss.dll.RGSSEval = ffi.cast("int(*)(const char*)", @@@RGSSEval_addr@@@)
 
--- 顶层实用函数
-function rgss.eval(code)
+-- 实用函数
+local function common_eval(code)
   -- TODO: RGSSEval异常处理
   local request = {
     code = code,
@@ -273,7 +273,7 @@ function rgss.eval(code)
   rgss.___get = nil
   return result
 end
-function rgss.call(receiver_object_key, signal_name, ...)
+local function common_call(receiver_object_key, signal_name, ...)
   -- TODO: RGSSEval异常处理
   local request = {
     key = receiver_object_key,
@@ -304,7 +304,7 @@ function rgss.class.write_to_ruby_obj(ruby_obj, k, v)
 end
 function rgss.class.call_on_ruby_obj(ruby_obj, signal_name, ...)
   local data = getmetatable(ruby_obj)[_RUBY_OBJ_KEY]
-  return rgss.call(data.key, signal_name, ...)
+  return common_call(data.key, signal_name, ...)
 end
 function rgss.class.test_eq_on_ruby_obj(ruby_obj1, ruby_obj2)
   local data1 = getmetatable(ruby_obj1)[_RUBY_OBJ_KEY]
@@ -384,7 +384,11 @@ function rgss.class.Proc(key, object_id)
   return rgss.class.Object(key, object_id, proc_functions, "Proc")
 end
 
--- 判断对象是否是ruby对象
+-- 执行一段Ruby代码，无参数，取得返回值
+rgss.eval = common_eval
+-- 对来自Ruby的对象使用，调用其方法，并取得返回值
+rgss.call = rgss.class.call_on_ruby_obj
+-- 判断对象是否是Ruby对象
 function rgss.is_ruby_object(x)
   return not not (type(x)=="table" and getmetatable(x)[_RUBY_OBJ_KEY])
 end
@@ -977,7 +981,7 @@ class Lua
   # 避免每次调用Lua的时候都重复为返回值创建Array，从而改善性能
   # rets_buffer的大小表示接受返回值的个数，
   # 个数超出容量时丢弃溢出部分，个数不足容量时用nil补足
-  def eval_with_buffer(func, rets_buffer, *args)
+  def eval_with_buffer(code, rets_buffer, *args)
     @lua.call_full(:push_code, code, rets_buffer, args)
   end
 
