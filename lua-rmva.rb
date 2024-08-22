@@ -673,7 +673,8 @@ class Lua_WrappedObject
   end
   # 转换为Debug查看数据显示
   def inspect
-    return "<Lua_WrappedObject:0x%x @key=%d, @type=%d>" % [object_id * 2, @key, @type]
+    return '<Lua_WrappedObject:0x%x @key=%d, @type=%d, tostring=%s>' \
+      % [object_id * 2, @key, @type, tostring]
   end
 
   # 视为table，访问其元素
@@ -830,6 +831,7 @@ class Lua_VM
   # 这时数组的长度不会变化，多余的对象舍弃，不足的对象用nil补足
   # 即使对象转化失败并抛出异常，Lua栈顶也会弹出这些对象
   def pop_n(n, out_array=nil)
+    n = 0 if n < 0
     out_array = Array.new(n) if out_array == nil
     len = out_array.length
     val_len = (n < len) ? n : len
@@ -839,12 +841,9 @@ class Lua_VM
     for i in val_len .. len-1
       out_array[i] = nil
     end
-  rescue
-    raise $!
-  ensure
-    out_array.fill(nil) if $! != nil
-    Lua_C.settop(@s, -n-1)
     return out_array
+  ensure
+    Lua_C.settop(@s, -n-1)
   end
   # 清空Lua栈，舍弃栈中所有对象
   def reset
@@ -932,11 +931,14 @@ BOOL WriteConsoleA(
 ]]
 local out_charsWritten = ffi.new('long[1]')
 local console = ffi.C.GetStdHandle(-11) -- stdout=-11
-local function write(str) ffi.C.WriteConsoleA(console, str, #str, out_charsWritten, nil) end
+local function write(str)
+  ffi.C.WriteConsoleA(console, str, #str, out_charsWritten, nil)
+end
 _G.print = function(...)
   local n = select(\'\#\', ...)
   for i = 1, n do
-    write(tostring(select(i, ...)))
+    local argi = select(i, ...)
+    write(tostring(argi))
     write((i~=n) and \'\\t\' or \'\\n\')
   end
   return nil
@@ -983,6 +985,6 @@ class Lua
   def close
     @lua.close
   end
-  alias dispose close
+  alias :dispose :close
 
 end
