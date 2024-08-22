@@ -172,18 +172,10 @@ class Lua_C
     err_enum_name = THREAD_STATUSES.find {
       |s| const_get(s) == value
     } || "Unknown Error #{value}"
-    getfield(lua_state, LUA_GLOBALSINDEX, 'tostring')
-    pushvalue(lua_state, -2)
-    convert_tostring_result = pcall(lua_state, 1, 1, 0)
-    error_string = nil
-    if convert_tostring_result == Lua_C::LUA_OK
-      error_string = tolstring(lua_state, -1, 0).force_encoding(__ENCODING__)
-    else
-      error_string = "<Unable to convert lua error to string>"
-    end
-    settop(lua_state, -3)
-    msg = "Error: Lua code failed to compile or run, error enum is #{err_enum_name},\n"
-    msg += "message is #{error_string}."
+    err_msg = tolstring(lua_state, -1, 0).force_encoding(__ENCODING__)
+    settop(lua_state, -2)
+    msg = "Error: Lua code failed to compile or run, error enum is #{err_enum_name}.\n"
+    msg += "Message: #{err_msg}."
     msg += (extra_msg==nil ? '' : ("\n" + extra_msg))
     raise msg
   end
@@ -514,7 +506,7 @@ class Lua_VM
   # 将Lua代码字符串编译为执行函数并推上Lua栈
   def push_code(str)
     result = Lua_C.loadstring(@s, str)
-    if result != Lua_C::LUA_OK
+    if result != Lua_C::LUA_OK || Lua_C.type(@s, -1) != Lua_C::LUA_TFUNCTION
       # 编译出错
       Lua_C.raise_thread_status_error(@s, result, "Code is: |\n#{str}") 
     end
@@ -523,7 +515,7 @@ class Lua_VM
   # 将Lua代码文件编译为执行函数并推上Lua栈
   def push_codefile(filename)
     result = Lua_C.loadfile(@s, filename)
-    if result != Lua_C::LUA_OK
+    if result != Lua_C::LUA_OK || Lua_C.type(@s, -1) != Lua_C::LUA_TFUNCTION
       # 编译出错
       Lua_C.raise_thread_status_error(@s, result, "Code file is #{filename}.")
     end
