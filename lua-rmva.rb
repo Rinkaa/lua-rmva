@@ -8,6 +8,17 @@
 #    - 岚风雷`<https://github.com/gqxastg>` (c) 2024
 #==============================================================================
 
+module Lua_Config
+  #--------------------------------------------------------------------------
+  # ■ 以下为设定部分
+  #--------------------------------------------------------------------------
+  DEFAULT_DLL_PATH = 'System/luajit2.1.1720049189_win32_04dca791.dll'
+  RGSS_DLL_FILENAME = 'RGSS301.dll'
+  #--------------------------------------------------------------------------
+  # ■ 设定部分到此结束，使用者无须修改以下内容
+  #--------------------------------------------------------------------------
+end
+
 # Lua C API
 class Lua_C
   LUA_REGISTRYINDEX = -10000
@@ -186,6 +197,7 @@ end
 # 引用键对应的对象在两语言环境中可以有不同表示，但在一侧的修改会跨语言界面传到另一侧
 class Lua_CrossBoundaryManager
 
+  include Lua_Config
   def initialize(lua_state, lua_object_wrapper, ruby_object_wrap_and_pusher)
     # 指定所用的Lua状态机
     @s = lua_state
@@ -404,7 +416,7 @@ EOF
     # 替换模板参数
     _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
     _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
-    _RGSSEval_addr = _GetProcAddress.(_GetModuleHandle.('RGSS301.dll'), 'RGSSEval')
+    _RGSSEval_addr = _GetProcAddress.(_GetModuleHandle.(RGSS_DLL_FILENAME), 'RGSSEval')
     lua_rgss_module_code.sub!('@@@RGSSEval_addr@@@', _RGSSEval_addr.to_s)
     lua_rgss_module_code.sub!('@@@CrossManager_object_id@@@', object_id.to_s) 
     lua_rgss_module_code.sub!('@@@CrossManager_object_id@@@', object_id.to_s)
@@ -934,40 +946,29 @@ end
 
 # 作为非正规解决方案的Lua代码，常用于临时用途或者实现单靠Ruby侧难实现的方法
 module Lua_Magics
+
+  include Lua_Config
   # 重设输出到调试控制台
+  _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
+  _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
+  rgssdll_addr = _GetModuleHandle.(RGSS_DLL_FILENAME)
+  # _RGSSEval_addr = _GetProcAddress.(rgssdll_addr, 'RGSSEval')
+  _RGSSSetStringUTF8_addr = _GetProcAddress.(rgssdll_addr, 'RGSSSetStringUTF8')
   PRINT = <<-EOF
--- lua
+local varname = '$LUA_PRINTED'
+
 local ffi = require 'ffi'
-ffi.cdef[[
-typedef void *HANDLE;
-typedef unsigned long DWORD;
-typedef DWORD *LPDWORD;
-typedef int BOOL;
-typedef void VOID;
-typedef void *LPVOID;
-HANDLE GetStdHandle(
-  long in_nStdHandle
-);
-BOOL WriteConsoleA(
-  HANDLE in_hConsoleOutput, 
-  const VOID *in_lpBuffer, 
-  DWORD in_nNumberOfCharsToWrite,
-  LPDWORD out_opt_lpNumberOfCharsWritten,
-  LPVOID lpReserved
-);
-]]
-local out_charsWritten = ffi.new('long[1]')
-local console = ffi.C.GetStdHandle(-11) -- stdout=-11
-local function write(str)
-  ffi.C.WriteConsoleA(console, str, #str, out_charsWritten, nil)
-end
+local rgss = require 'rgss'
+rgss.dll.RGSSSetStringUTF8 = ffi.cast('void(*)(const char*, const char*)', #{_RGSSSetStringUTF8_addr})
 _G.print = function(...)
   local n = select(\'\#\', ...)
+  local str = ''
   for i = 1, n do
     local argi = select(i, ...)
-    write(tostring(argi))
-    write((i~=n) and \'\\t\' or \'\\n\')
+    str = str .. tostring(argi) .. ((i~=n) and \'\\t\' or \'\\n\')
   end
+  rgss.dll.RGSSSetStringUTF8(varname, str)
+  rgss.dll.RGSSEval('print '.. varname)
   return nil
 end
 EOF
@@ -976,9 +977,10 @@ end
 # 用户可使用的各方法
 class Lua
 
+  include Lua_Config
   # 初始化
   # 创建Lua虚拟机，并且初始化必要的库和临时方案
-  def initialize(dll_path='System/lua51.dll')
+  def initialize(dll_path=DEFAULT_DLL_PATH)
     # 第一次还没加载DLL的话，先加载DLL
     Lua_C.load(dll_path) if not Lua_C.loaded?
     # 创建Lua虚拟机
