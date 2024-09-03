@@ -140,10 +140,9 @@ Lua | Ruby
 
 ## 贡献者
 
-- 域外创音`<https://github.com/rinkaa, kaitensekai@qq.com>` (c) 2024
-- 岚风雷`<https://github.com/gqxastg>` (c) 2024
+- 域外创音`<https://github.com/rinkaa, https://rpg.blue/home.php?mod=space&uid=2712193, kaitensekai@qq.com>` (c) 2024
+- 岚风雷`<https://github.com/gqxastg, https://rpg.blue/home.php?mod=space&uid=216371>` (c) 2024
 
 ## 许可证
 
-（暂未确定）
-
+MIT
