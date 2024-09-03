@@ -12,7 +12,7 @@ module Lua_Config
   #--------------------------------------------------------------------------
   # ■ 以下为设定部分
   #--------------------------------------------------------------------------
-  DEFAULT_DLL_PATH = 'System/luajit2.1.1720049189_win32_04dca791.dll'
+  DEFAULT_DLL_PATH = 'System/lua51.dll'
   RGSS_DLL_FILENAME = 'RGSS301.dll'
   #--------------------------------------------------------------------------
   # ■ 设定部分到此结束，使用者无须修改以下内容
@@ -241,6 +241,9 @@ class Lua_CrossBoundaryManager
 
   # 初始化跨界面调用设施
   def _init_cross_call_utils
+    _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
+    _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
+    _RGSSEval_addr = _GetProcAddress.(_GetModuleHandle.(RGSS_DLL_FILENAME), 'RGSSEval')
     # Lua侧的调用Ruby设施形式：（通过require("rgss")访问）
     #   `LUA_REGISTRY`["lua-rmva"]["rgss"]  -- 从Registry快速访问这个模块的方式
     #                                    -- （注意，这个模块没有反过来指向Registry的引用）
@@ -254,6 +257,7 @@ class Lua_CrossBoundaryManager
     #   `rgss`.class.Hash   -- 来自Ruby的Hash对象的便捷包装
     #   `rgss`.class.Method -- 来自Ruby的Method对象的便捷包装
     #   `rgss`.class.Proc   -- 来自Ruby的Proc对象的便捷包装
+    #   `rgss`.release          -- 取消占有对象，重新允许垃圾回收机制回收对象
     #   `rgss`.is_ruby_object   -- 对象是否是来自Ruby的对象
     #   `rgss`.error_handler    -- 错误发生时对错误信息的包装（例如加入调用栈信息）
     # 建立Lua侧的rgss模块，用Lua写成`rgss`.call`, rgss`.eval, `rgss`.class
@@ -265,9 +269,15 @@ local rgss = {}
 local ffi = require "ffi"
   -- 在Ruby中替换此@@@模板参数为当时的addr
 rgss.dll = {}
-rgss.dll.RGSSEval = ffi.cast("int(*)(const char*)", @@@RGSSEval_addr@@@)
+rgss.dll.RGSSEval = ffi.cast("int(*)(const char*)", #{_RGSSEval_addr.to_s})
 
--- 实用函数
+-- 找到跨语言管理的引用
+local cross = rgss.dll.RGSSEval([[
+  # ruby
+  ObjectSpace._id2ref(#{object_id.to_s})
+]])
+
+-- 基本估值和调用方法（不能直接用已经在lua里的`local cross`是因为要避免无限递归）
 local function common_eval(code)
   -- TODO: RGSSEval异常处理
   local request = {
@@ -276,8 +286,7 @@ local function common_eval(code)
   rgss.___post = request
   local eval_return_code = rgss.dll.RGSSEval([[
     # ruby
-      # 在Ruby中替换此@@@模板参数为当时的id
-    cross = ObjectSpace._id2ref(@@@CrossManager_object_id@@@)
+    cross = ObjectSpace._id2ref(#{object_id.to_s})
     cross.handle_eval_request
   ]])
   rgss.___post = nil
@@ -296,8 +305,7 @@ local function common_call(receiver_object_key, signal_name, ...)
   rgss.___post = request
   local eval_return_code = rgss.dll.RGSSEval([[
     # ruby
-    # 在Ruby控制Lua运行此lua_rgss_module代码前替换此@@@模板参数为当时的id
-    cross = ObjectSpace._id2ref(@@@CrossManager_object_id@@@)
+    cross = ObjectSpace._id2ref(#{object_id.to_s})
     cross.handle_call_request
   ]])
   rgss.___post = nil
@@ -396,14 +404,22 @@ function rgss.class.Proc(key, object_id)
   return rgss.class.Object(key, object_id, proc_functions, "Proc")
 end
 
+--- 实用函数
+
 -- 执行一段Ruby代码，无参数，取得返回值
 rgss.eval = common_eval
 -- 对来自Ruby的对象使用，调用其方法，并取得返回值
 rgss.call = rgss.class.call_on_ruby_obj
+-- 取消跨语言对象的引用；重新允许垃圾回收机制回收这个对象
+-- 也可以在Ruby中调用，和这里同义，两侧中只要有一侧调用过即可生效
+function rgss.release(x)
+  return cross("release_obj", x)
+end
 -- 判断对象是否是Ruby对象
 function rgss.is_ruby_object(x)
   return not not (type(x)=="table" and getmetatable(x)[_RUBY_OBJ_KEY])
 end
+
 -- 发生错误时包装错误
 -- TODO: 把error_handler放在Lua_CrossBoundaryManager有点不妥当，之后需要移动到Lua_VM类下
 function rgss.error_handler(err)
@@ -413,13 +429,6 @@ end
 package.loaded["rgss"] = rgss
 return rgss
 EOF
-    # 替换模板参数
-    _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
-    _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
-    _RGSSEval_addr = _GetProcAddress.(_GetModuleHandle.(RGSS_DLL_FILENAME), 'RGSSEval')
-    lua_rgss_module_code.sub!('@@@RGSSEval_addr@@@', _RGSSEval_addr.to_s)
-    lua_rgss_module_code.sub!('@@@CrossManager_object_id@@@', object_id.to_s) 
-    lua_rgss_module_code.sub!('@@@CrossManager_object_id@@@', object_id.to_s)
     # 估值Lua代码并将其挂载到Registry
     load_result = Lua_C.loadstring(@s, lua_rgss_module_code)
     if load_result != Lua_C::LUA_OK || Lua_C.type(@s, -1) != Lua_C::LUA_TFUNCTION
@@ -678,7 +687,7 @@ EOF
       arg1 = argv.get(1)
       arg2 = argv.get(2)
       arg3 = argv.get(3)
-      result = receiver.send(signal_name, arg1. arg2, arg3)
+      result = receiver.send(signal_name, arg1, arg2, arg3)
     else
       args = Array.new
       for i in 1..argc
@@ -1011,6 +1020,7 @@ class Lua
   end
 
   # 取消跨语言对象的引用；重新允许垃圾回收机制回收这个对象
+  # 也可以在Lua中调用，和这里同义，两侧中只要有一侧调用过即可生效
   def release(obj)
     @lua.cross.release_obj(obj)
   end
