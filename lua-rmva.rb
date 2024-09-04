@@ -94,11 +94,11 @@ class Lua_C
     add_method.(:pushnil, 'lua_pushnil', 'i', '')
     add_method.(:pushboolean, 'lua_pushboolean', 'ii', '')
     # add_method.(:pushnumber, 'lua_pushnumber', 'ill', '') # 特殊，见下面
-    add_method.(:pushstring, 'lua_pushstring', 'ip', '')
+    add_method.(:pushlstring, 'lua_pushlstring', 'ipi', '')
     add_method.(:type, 'lua_type', 'ii', 'i')
     add_method.(:toboolean, 'lua_toboolean', 'ii', 'i')
     # add_method.(:tonumber, 'lua_tonumber', 'ii', 'l') # 特殊，见下面
-    add_method.(:tolstring, 'lua_tolstring', 'iii', 'p')
+    # add_method.(:tolstring, 'lua_tolstring', 'iii', 'p') # 特殊，见下面
 
     add_method.(:createtable, 'lua_createtable', 'iii', '')
     add_method.(:pushvalue, 'lua_pushvalue', 'ii', '')
@@ -108,6 +108,15 @@ class Lua_C
     add_method.(:settable, 'lua_settable', 'ii', '')
     add_method.(:insert, 'lua_insert', 'ii', '')
 
+    _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
+    _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
+    _VirtualAlloc = Win32API.new('kernel32', 'VirtualAlloc', 'llll', 'l')
+    _VirtualFree = Win32API.new('kernel32', 'VirtualFree', 'lll', 'l')
+    # VirtualProtect = Win32API.new('kernel32', 'VirtualProtect', 'llll', 'l')
+    _RtlMoveMemory_lp = Win32API.new('kernel32', 'RtlMoveMemory', 'lpi', '')
+    _RtlMoveMemory_pl = Win32API.new('kernel32', 'RtlMoveMemory', 'pli', '')
+    _CallWindowProc_ippii = Win32API.new('user32', 'CallWindowProc', 'ippii', 'i')
+
     # lua_pushnumber发送2字长的double的对策
     # 把8字节的double拆成两个4字节的'l'传递
     _lua_pushnumber_inner = Win32API.new(dll_path, 'lua_pushnumber', 'ill', '')
@@ -116,14 +125,19 @@ class Lua_C
       _lua_pushnumber_inner.(lua_state, built_buffer[0], built_buffer[1])
     })
 
+    # lua_tolstring返回带\0的字符串的对策
+    # 返回一个指针地址，使用指针参数给出的字节数来建立带\0的字符串
+    _lua_tolstring_inner = Win32API.new(dll_path, 'lua_tolstring', 'iip', 'l')
+    define_singleton_method(:tolstring, lambda { |lua_state, idx|
+      length_buffer = '\0' * 4
+      str_pointer = _lua_tolstring_inner.(lua_state, idx, length_buffer)
+      str_bytesize = length_buffer.unpack('L').first
+      str_buffer = ' ' * str_bytesize
+      _RtlMoveMemory_pl.(str_buffer, str_pointer, str_bytesize)
+      str_buffer
+    })
+
     # lua_tonumber返回2字长的double的对策
-    _GetProcAddress = Win32API.new('kernel32', 'GetProcAddress', 'lp', 'l')
-    _GetModuleHandle = Win32API.new('kernel32', 'GetModuleHandle', 'p', 'l')
-    _VirtualAlloc = Win32API.new('kernel32', 'VirtualAlloc', 'llll', 'l')
-    _VirtualFree = Win32API.new('kernel32', 'VirtualFree', 'lll', 'l')
-    #~ VirtualProtect = Win32API.new('kernel32', 'VirtualProtect', 'llll', 'l')
-    _RtlMoveMemory_lp = Win32API.new('kernel32', 'RtlMoveMemory', 'lpi', '')
-    _CallWindowProc_ippii = Win32API.new('user32', 'CallWindowProc', 'ippii', 'i')
     @@lua_tonumber_addr = _GetProcAddress.(
       _GetModuleHandle.(File.basename(dll_path)), 'lua_tonumber')
     @@lua_tonumber_addr_p = [@@lua_tonumber_addr].pack('L')
@@ -205,7 +219,7 @@ class Lua_C
     err_enum_name = THREAD_STATUSES.find {
       |s| const_get(s) == value
     } || "Unknown Error #{value}"
-    err_msg = tolstring(lua_state, -1, 0).force_encoding(__ENCODING__)
+    err_msg = tolstring(lua_state, -1).force_encoding(__ENCODING__)
     settop(lua_state, -2)
     msg = "Error: Lua code failed to compile or run, error enum is #{err_enum_name}.\n"
     msg += "Message: #{err_msg}."
@@ -455,7 +469,7 @@ EOF
     load_result = Lua_C.loadstring(@s, lua_rgss_module_code)
     if load_result != Lua_C::LUA_OK || Lua_C.type(@s, -1) != Lua_C::LUA_TFUNCTION
       # 编译出错
-      Lua_C.raise_thread_status_error(@s, load_result, "Code is: |\n#{lua_rgss_module_code}") 
+      Lua_C.raise_thread_status_error(@s, load_result, "Code is: |\n#{lua_rgss_module_code}")
     end
     run_result = Lua_C.pcall(@s, 0, 1, 0) # <1>=`rgss`
     if run_result != Lua_C::LUA_OK
@@ -593,7 +607,7 @@ EOF
     elsif x.is_a?(Numeric)
       Lua_C.pushnumber(@s, x)
     elsif x.is_a?(String)
-      Lua_C.pushstring(@s, x)
+      Lua_C.pushlstring(@s, x, x.bytesize)
     elsif x.is_a?(Array)
       key = get_or_appoint_key_of_ruby_obj(x, 'Array')
       push_key(key)
@@ -647,7 +661,7 @@ EOF
     elsif t == Lua_C::LUA_TNUMBER
       return Lua_C.tonumber(@s, idx)
     elsif t == Lua_C::LUA_TSTRING
-      return Lua_C.tolstring(@s, idx, 0).force_encoding(__ENCODING__)
+      return Lua_C.tolstring(@s, idx).force_encoding(__ENCODING__)
     elsif
       t == Lua_C::LUA_TTABLE \
       || t == Lua_C::LUA_TFUNCTION \
